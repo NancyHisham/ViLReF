@@ -34,35 +34,26 @@ def is_master(args):
     return True  # Always True when not using distributed
 
 
-def debug(rank, world_size=1):
-    args = parse_kaggle_args()  # Get arguments from the command line
+def debug(rank):
+    args = parse_args()
 
-    # Set distributed group
-    args.local_device_rank = max(args.local_rank, 0)
-    torch.cuda.set_device(args.local_device_rank)
-    args.device = torch.device("cuda", args.local_device_rank)
-
-    dist.init_process_group(backend="nccl", init_method='env://', world_size=world_size, rank=rank)
-    args.rank = dist.get_rank()
-    args.world_size = dist.get_world_size()
+    # Set device for training
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
 
     # Set output path
     time_suffix = strftime("%Y-%m-%d-%H-%M-%S", gmtime())
     args.log_path = os.path.join(args.logs, args.name, "out_{}.log".format(time_suffix))
 
     args.checkpoint_path = os.path.join(args.logs, args.name, "checkpoints")
-    if is_master(args):
-        for dirname in [args.checkpoint_path]:
-            if dirname:
-                os.makedirs(dirname, exist_ok=True)
+    os.makedirs(args.checkpoint_path, exist_ok=True)
 
     assert args.precision in ['amp', 'fp16', 'fp32']
 
     # Set logger
     args.log_level = logging.DEBUG if args.debug else logging.INFO
-    log_queue = setup_primary_logging(args.log_path, args.log_level, args.rank)
-
-    setup_worker_logging(args.rank, log_queue, args.log_level)
+    log_queue = setup_primary_logging(args.log_path, args.log_level, 0)  # rank is 0 in non-distributed
+    setup_worker_logging(0, log_queue, args.log_level)
 
     # Build the model
     vision_model_config_file = Path(__file__).parent.parent / f"clip/model_configs/{args.vision_model.replace('/', '-')}.json"
@@ -89,10 +80,11 @@ def debug(rank, world_size=1):
     load(model, clip_path=args.clip_weight_path, bert_path=args.bert_weight_path,
          use_flash_attention=args.use_flash_attention)
 
+    # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
     if args.precision == "amp" or args.precision == "fp32":
         convert_models_to_fp32(model)
 
-    model.cuda(args.local_device_rank)
+    model = model.to(device)
     if args.precision == "fp16":
         convert_weights(model)
 
@@ -119,14 +111,9 @@ def debug(rank, world_size=1):
                     m.eval()
         logging.info("The visual encoder is freezed during training.")
 
-    # Check if model is wrapped in DDP
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        model = model.module  # Unwrap model from DDP
-
-    # To make compatible with torch version <= 1.8.0, set find_unused_parameters to True
-    find_unused_parameters = torch_version_str_compare_lessequal(torch.__version__, "1.8.0")
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_device_rank],
-                                                      find_unused_parameters=find_unused_parameters)
+    # Automatic Mixed Precision or FP16
+    if args.precision == "fp16":
+        convert_weights(model)
 
     # Automatically restore latest checkpoint if exists
     if args.resume is not None:
@@ -134,22 +121,28 @@ def debug(rank, world_size=1):
             logging.info(f"=> begin to load checkpoint '{args.resume}'")
             checkpoint = torch.load(args.resume, map_location="cpu")
             sd = {k: v for k, v in checkpoint["state_dict"].items() if "bert.pooler" not in k}
+            # Resize the positional embedding by interpolation, if needed
             resize_pos_embed(sd, model, prefix="module.")
+            # Adapt flash attention
             if args.use_flash_attention:
                 sd = convert_state_dict(sd)
+            # Load the state dict
             model.load_state_dict(sd, False)
         else:
-            logging.info("=> no checkpoint found at '{}'".format(args.resume))
+            logging.info(f"=> no checkpoint found at '{args.resume}'")
 
+    target_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    
     if args.use_visual:
-        del model.bert  # Removed `module` and access directly
+        del target_model.bert
     elif args.use_bert:
-        del model.visual  # Removed `module` and access directly
+        del target_model.visual
+
 
     extractor = feat_extract_img(model)
 
-    # Example of loading images (as placeholder)
-    imgs = torch.randn([1, 3, 224, 224]).cuda()
+    # Example image processing
+    imgs = torch.randn([1, 3, 224, 224]).to(device)
     feat = extractor(imgs)
 
 
